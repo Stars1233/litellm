@@ -66,6 +66,7 @@ from litellm.litellm_core_utils.core_helpers import (
     map_finish_reason,
     process_response_headers,
 )
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.default_encoding import encoding
 from litellm.litellm_core_utils.exception_mapping_utils import (
     _get_response_headers,
@@ -141,6 +142,7 @@ from litellm.types.utils import (
     ChatCompletionMessageToolCall,
     Choices,
     CostPerToken,
+    CredentialItem,
     CustomHuggingfaceTokenizer,
     Delta,
     Embedding,
@@ -454,6 +456,18 @@ def get_applied_guardrails(kwargs: Dict[str, Any]) -> List[str]:
                     applied_guardrails.append(callback.guardrail_name)
 
     return applied_guardrails
+
+
+def load_credentials_from_list(kwargs: dict):
+    """
+    Updates kwargs with the credentials if credential_name in kwarg
+    """
+    credential_name = kwargs.get("litellm_credential_name")
+    if credential_name and litellm.credential_list:
+        credential_accessor = CredentialAccessor.get_credential_values(credential_name)
+        for key, value in credential_accessor.items():
+            if key not in kwargs:
+                kwargs[key] = value
 
 
 def get_dynamic_callbacks(
@@ -989,6 +1003,8 @@ def client(original_function):  # noqa: PLR0915
                 logging_obj, kwargs = function_setup(
                     original_function.__name__, rules_obj, start_time, *args, **kwargs
                 )
+            ## LOAD CREDENTIALS
+            load_credentials_from_list(kwargs)
             kwargs["litellm_logging_obj"] = logging_obj
             _llm_caching_handler: LLMCachingHandler = LLMCachingHandler(
                 original_function=original_function,
@@ -1245,6 +1261,8 @@ def client(original_function):  # noqa: PLR0915
                     original_function.__name__, rules_obj, start_time, *args, **kwargs
                 )
             kwargs["litellm_logging_obj"] = logging_obj
+            ## LOAD CREDENTIALS
+            load_credentials_from_list(kwargs)
             logging_obj._llm_caching_handler = _llm_caching_handler
             # [OPTIONAL] CHECK BUDGET
             if litellm.max_budget:
@@ -1957,6 +1975,39 @@ def supports_system_messages(model: str, custom_llm_provider: Optional[str]) -> 
     )
 
 
+def supports_native_streaming(model: str, custom_llm_provider: Optional[str]) -> bool:
+    """
+    Check if the given model supports native streaming and return a boolean value.
+
+    Parameters:
+    model (str): The model name to be checked.
+    custom_llm_provider (str): The provider to be checked.
+
+    Returns:
+    bool: True if the model supports native streaming, False otherwise.
+
+    Raises:
+    Exception: If the given model is not found in model_prices_and_context_window.json.
+    """
+    try:
+        model, custom_llm_provider, _, _ = litellm.get_llm_provider(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+
+        model_info = _get_model_info_helper(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+        supports_native_streaming = model_info.get("supports_native_streaming", True)
+        if supports_native_streaming is None:
+            supports_native_streaming = True
+        return supports_native_streaming
+    except Exception as e:
+        verbose_logger.debug(
+            f"Model not found or error in checking supports_native_streaming support. You passed model={model}, custom_llm_provider={custom_llm_provider}. Error: {str(e)}"
+        )
+        return False
+
+
 def supports_response_schema(
     model: str, custom_llm_provider: Optional[str] = None
 ) -> bool:
@@ -2433,8 +2484,11 @@ def get_optional_params_image_gen(
         config_class = (
             litellm.AmazonStability3Config
             if litellm.AmazonStability3Config._is_stability_3_model(model=model)
-            else litellm.AmazonNovaCanvasConfig if litellm.AmazonNovaCanvasConfig._is_nova_model(model=model)
-            else litellm.AmazonStabilityConfig
+            else (
+                litellm.AmazonNovaCanvasConfig
+                if litellm.AmazonNovaCanvasConfig._is_nova_model(model=model)
+                else litellm.AmazonStabilityConfig
+            )
         )
         supported_params = config_class.get_supported_openai_params(model=model)
         _check_valid_arg(supported_params=supported_params)
@@ -3929,8 +3983,10 @@ def _count_characters(text: str) -> int:
     return len(filtered_text)
 
 
-def get_response_string(response_obj: ModelResponse) -> str:
-    _choices: List[Union[Choices, StreamingChoices]] = response_obj.choices
+def get_response_string(response_obj: Union[ModelResponse, ModelResponseStream]) -> str:
+    _choices: Union[List[Union[Choices, StreamingChoices]], List[StreamingChoices]] = (
+        response_obj.choices
+    )
 
     response_str = ""
     for choice in _choices:
@@ -6089,6 +6145,8 @@ class ProviderConfigManager:
             return litellm.CohereChatConfig()
         elif litellm.LlmProviders.COHERE == provider:
             return litellm.CohereConfig()
+        elif litellm.LlmProviders.SNOWFLAKE == provider:
+            return litellm.SnowflakeConfig()
         elif litellm.LlmProviders.CLARIFAI == provider:
             return litellm.ClarifaiConfig()
         elif litellm.LlmProviders.ANTHROPIC == provider:
