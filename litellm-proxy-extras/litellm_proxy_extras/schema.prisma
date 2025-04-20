@@ -169,6 +169,7 @@ model LiteLLM_VerificationToken {
     budget_duration String? 
     budget_reset_at DateTime?
     allowed_cache_controls String[] @default([])
+    allowed_routes   String[] @default([])
     model_spend      Json @default("{}")
     model_max_budget Json @default("{}")
     budget_id String?
@@ -372,7 +373,7 @@ model LiteLLM_DailyTeamSpend {
 // Track daily team spend metrics per model and key
 model LiteLLM_DailyTagSpend {
   id                  String   @id @default(uuid())
-  tag                 String   @unique
+  tag                 String   
   date                String
   api_key             String   
   model               String   
