@@ -405,7 +405,8 @@ export default function CreateKeyPage() {
                   userRole={userRole}
                   token={token}
                   accessToken={accessToken}
-                  allTeams={(teams as Team[]) ?? []}
+                  allTeams={teams as Team[] ?? []}
+                  premiumUser={premiumUser}
                 />
               ) : page == "mcp-servers" ? (
                 <MCPServers
@@ -431,6 +432,7 @@ export default function CreateKeyPage() {
                   userRole={userRole}
                   accessToken={accessToken}
                   teams={(teams as Team[]) ?? []}
+                  premiumUser={premiumUser}
                 />
               ) : (
                 <Usage
