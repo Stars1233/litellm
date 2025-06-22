@@ -16,7 +16,9 @@ from typing import (
     TYPE_CHECKING,
     Any,
     List,
+    Literal,
     Optional,
+    Set,
     Tuple,
     Union,
     cast,
@@ -26,6 +28,7 @@ from typing import (
 )
 
 from litellm.constants import (
+    BASE_MCP_ROUTE,
     DEFAULT_MAX_RECURSE_DEPTH,
     DEFAULT_SLACK_ALERTING_THRESHOLD,
     LITELLM_EMBEDDING_PROVIDERS_SUPPORTING_INPUT_ARRAY_OF_TOKENS,
@@ -143,7 +146,10 @@ from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
-from litellm.proxy._experimental.mcp_server.server import router as mcp_router
+from litellm.proxy._experimental.mcp_server.rest_endpoints import (
+    router as mcp_rest_endpoints_router,
+)
+from litellm.proxy._experimental.mcp_server.server import app as mcp_app
 from litellm.proxy._experimental.mcp_server.tool_registry import (
     global_mcp_tool_registry,
 )
@@ -417,6 +423,9 @@ except ImportError:
 server_root_path = os.getenv("SERVER_ROOT_PATH", "")
 _license_check = LicenseCheck()
 premium_user: bool = _license_check.is_premium()
+premium_user_data: Optional["EnterpriseLicenseData"] = (
+    _license_check.airgapped_license_data
+)
 global_max_parallel_request_retries_env: Optional[str] = os.getenv(
     "LITELLM_GLOBAL_MAX_PARALLEL_REQUEST_RETRIES"
 )
@@ -744,6 +753,48 @@ origins = ["*"]
 try:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     ui_path = os.path.join(current_dir, "_experimental", "out")
+    litellm_asset_prefix = "/litellm-asset-prefix"
+    # Iterate through files in the UI directory
+    for root, dirs, files in os.walk(ui_path):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            # Skip binary files and files that don't need path replacement
+            if filename.endswith(
+                (
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".ico",
+                    ".woff",
+                    ".woff2",
+                    ".ttf",
+                    ".eot",
+                )
+            ):
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                # Replace the asset prefix with the server root path
+                modified_content = content.replace(
+                    f"{litellm_asset_prefix}",
+                    f"{server_root_path}",
+                )
+
+                # Replace the /.well-known/litellm-ui-config with the server root path
+                modified_content = modified_content.replace(
+                    "/litellm/.well-known/litellm-ui-config",
+                    f"{server_root_path}/.well-known/litellm-ui-config",
+                )
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(modified_content)
+            except UnicodeDecodeError:
+                # Skip binary files that can't be decoded
+                continue
+
     # # Mount the _next directory at the root level
     app.mount(
         "/_next",
@@ -751,38 +802,15 @@ try:
         name="next_static",
     )
     app.mount(
-        "/litellm/_next",
+        f"{litellm_asset_prefix}/_next",
         StaticFiles(directory=os.path.join(ui_path, "_next")),
         name="next_static",
     )
     # print(f"mounted _next at {server_root_path}/ui/_next")
 
     app.mount("/ui", StaticFiles(directory=ui_path, html=True), name="ui")
-    # if len(server_root_path) > 0:
-    #     app.mount(f"{server_root_path}/ui", StaticFiles(directory=ui_path, html=True), name="ui")
-    #     print(f"mounted ui at {server_root_path}/ui")
 
-    # # Add middleware to rewrite static asset paths
-    # @app.middleware("http")
-    # async def rewrite_static_paths(request: Request, call_next):
-    #     response = await call_next(request)
-
-    #     print(f"response.headers: {response.headers}, request.url.path: {request.url.path}")
-
-    #     # Only modify HTML responses from the UI
-    #     if request.url.path.startswith(f"{server_root_path}/ui"):
-    #         print(f"rewriting static paths for {request.url.path}")
-    #         content = await response.body()
-    #         # Replace /ui/_next with /litellm/ui/_next
-    #         modified_content = content.replace(b'/ui/_next', f'{server_root_path}/ui/_next'.encode())
-    #         return Response(
-    #             content=modified_content,
-    #             status_code=response.status_code,
-    #             headers=dict(response.headers),
-    #             media_type=response.media_type
-    #         )
-    #     return response
-    # Iterate through files in the UI directory
+    # Handle HTML file restructuring
     for filename in os.listdir(ui_path):
         if filename.endswith(".html") and filename != "index.html":
             # Create a folder with the same name as the HTML file
@@ -794,20 +822,6 @@ try:
             src = os.path.join(ui_path, filename)
             dst = os.path.join(folder_path, "index.html")
             os.rename(src, dst)
-
-    # if server_root_path != "":
-    #     verbose_proxy_logger.info(  # noqa
-    #         f"server_root_path is set, forwarding any /ui requests to {server_root_path}/ui, any /sso/key/generate requests to {server_root_path}/sso/key/generate"
-    #     )  # noqa
-
-    #     @app.middleware("http")
-    #     async def redirect_ui_middleware(request: Request, call_next):
-    #         if request.url.path.startswith("/ui"):
-    #             new_url = str(request.url).replace("/ui", f"{server_root_path}/ui", 1)
-    #             return RedirectResponse(new_url)
-    #         elif request.url.path == "/sso/key/generate":
-    #             return RedirectResponse(f"{server_root_path}/sso/key/generate")
-    #         return await call_next(request)
 
 except Exception:
     pass
@@ -2770,7 +2784,8 @@ class ProxyConfig:
         """
         await self._init_guardrails_in_db(prisma_client=prisma_client)
         await self._init_vector_stores_in_db(prisma_client=prisma_client)
-        # await self._init_mcp_servers_in_db()
+        await self._init_mcp_servers_in_db()
+        await self._init_pass_through_endpoints_in_db()
 
     async def _init_guardrails_in_db(self, prisma_client: PrismaClient):
         from litellm.proxy.guardrails.guardrail_registry import (
@@ -2847,6 +2862,13 @@ class ProxyConfig:
                     str(e)
                 )
             )
+
+    async def _init_pass_through_endpoints_in_db(self):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            initialize_pass_through_endpoints_in_db,
+        )
+
+        await initialize_pass_through_endpoints_in_db()
 
     def decrypt_credentials(self, credential: Union[dict, BaseModel]) -> CredentialItem:
         if isinstance(credential, dict):
@@ -3490,6 +3512,7 @@ async def model_list(
     return_wildcard_routes: Optional[bool] = False,
     team_id: Optional[str] = None,
     include_model_access_groups: Optional[bool] = False,
+    only_model_access_groups: Optional[bool] = False,
 ):
     """
     Use `/model/info` - to get detailed model information, example - pricing, mode, etc.
@@ -3505,6 +3528,15 @@ async def model_list(
     else:
         proxy_model_list = llm_router.get_model_names()
         model_access_groups = llm_router.get_model_access_groups()
+
+    ## if only_model_access_groups is True,
+    """
+    1. Get all models key/user/team has access to
+    2. Filter out models that are not model access groups
+    3. Return the models
+    """
+    if only_model_access_groups is True:
+        include_model_access_groups = True
 
     key_models = get_key_models(
         user_api_key_dict=user_api_key_dict,
@@ -3543,6 +3575,7 @@ async def model_list(
         llm_router=llm_router,
         model_access_groups=model_access_groups,
         include_model_access_groups=include_model_access_groups,
+        only_model_access_groups=only_model_access_groups,
     )
 
     return dict(
@@ -4235,8 +4268,16 @@ async def audio_speech(
             user_api_key_dict=user_api_key_dict,
             request_data=data,
         )
+        # Determine media type based on model type
+        media_type = "audio/mpeg"  # Default for OpenAI TTS
+        request_model = data.get("model", "")
+        if "gemini" in request_model.lower() and (
+            "tts" in request_model.lower() or "preview-tts" in request_model.lower()
+        ):
+            media_type = "audio/wav"  # Gemini TTS returns WAV format after conversion
+
         return StreamingResponse(
-            generate(response), media_type="audio/mpeg", headers=custom_headers  # type: ignore
+            generate(response), media_type=media_type, headers=custom_headers  # type: ignore
         )
 
     except Exception as e:
@@ -5492,6 +5533,139 @@ async def non_admin_all_models(
     return unique_models
 
 
+async def get_all_team_models(
+    user_teams: Union[List[str], Literal["*"]],
+    prisma_client: PrismaClient,
+    llm_router: Router,
+) -> Dict[str, List[str]]:
+    """
+    Get all models across all teams user is in.
+
+    1. Get all teams user is in
+    2. Get all models across all teams
+    3. Return {"model_id": ["team_id1", "team_id2"]}
+    """
+    team_models: Dict[str, Set[str]] = {}
+    team_db_objects_typed: List[LiteLLM_TeamTable] = []
+
+    if user_teams == "*":
+        team_db_objects = await prisma_client.db.litellm_teamtable.find_many()
+        team_db_objects_typed = [
+            LiteLLM_TeamTable(**team_db_object.model_dump())
+            for team_db_object in team_db_objects
+        ]
+    else:
+        team_db_objects = await prisma_client.db.litellm_teamtable.find_many(
+            where={"team_id": {"in": user_teams}}
+        )
+        team_db_objects_typed = [
+            LiteLLM_TeamTable(**team_db_object.model_dump())
+            for team_db_object in team_db_objects
+        ]
+
+    for team_object in team_db_objects_typed:
+        if (
+            len(team_object.models) == 0  # empty list = all model access
+            or SpecialModelNames.all_proxy_models.value in team_object.models
+        ):
+            _model_ids = llm_router.get_model_ids()
+            if _model_ids is not None:
+                for model_id in _model_ids:
+                    team_models.setdefault(model_id, set()).add(team_object.team_id)
+        else:
+            for model_name in team_object.models:
+                _models = llm_router.get_model_list(model_name=model_name)
+                if _models is not None:
+                    for model in _models:
+                        model_id = model.get("model_info", {}).get("id", None)
+                        if model_id is not None:
+                            team_models.setdefault(model_id, set()).add(
+                                team_object.team_id
+                            )
+
+    # convert set to list
+    returned_team_models: Dict[str, List[str]] = {}
+    for model_id, team_ids in team_models.items():
+        returned_team_models[model_id] = list(team_ids)
+
+    return returned_team_models
+
+
+def get_direct_access_models(
+    user_db_object: LiteLLM_UserTable,
+    llm_router: Router,
+) -> List[str]:
+    """
+    Get all models that user has direct access to
+    """
+
+    direct_access_models: List[str] = []
+    for model in user_db_object.models:
+        deployments = llm_router.get_model_list(model_name=model)
+        if deployments is not None:
+            for deployment in deployments:
+                model_id = deployment.get("model_info", {}).get("id", None)
+                if model_id is not None:
+                    direct_access_models.append(model_id)
+    return direct_access_models
+
+
+async def get_all_team_and_direct_access_models(
+    user_api_key_dict: UserAPIKeyAuth,
+    prisma_client: PrismaClient,
+    llm_router: Router,
+    all_models: List[Dict],
+) -> List[Dict]:
+    """
+    Get all models across all teams user is in.
+    """
+
+    user_teams: Optional[Union[List[str], Literal["*"]]] = None
+    direct_access_models: List[str] = []
+    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
+        user_teams = "*"
+        direct_access_models = llm_router.get_model_ids()  # has access to all models
+    else:
+        user_db_object = await prisma_client.db.litellm_usertable.find_unique(
+            where={"user_id": user_api_key_dict.user_id}
+        )
+        if user_db_object is not None:
+            user_object = LiteLLM_UserTable(**user_db_object.model_dump())
+            user_teams = user_object.teams or []
+            direct_access_models = get_direct_access_models(
+                user_db_object=user_object,
+                llm_router=llm_router,
+            )
+    ## ADD ACCESS_VIA_TEAM_IDS TO ALL MODELS
+    if user_teams is not None:
+        team_models = await get_all_team_models(
+            user_teams=user_teams,
+            prisma_client=prisma_client,
+            llm_router=llm_router,
+        )
+        for _model in all_models:
+            model_id = _model.get("model_info", {}).get("id", None)
+            if model_id is not None:
+                _model["model_info"]["access_via_team_ids"] = team_models.get(
+                    model_id, []
+                )
+
+    ## ADD DIRECT_ACCESS TO RELEVANT MODELS
+    for _model in all_models:
+        model_id = _model.get("model_info", {}).get("id", None)
+        if model_id is not None and model_id in direct_access_models:
+            _model["model_info"]["direct_access"] = True
+
+    ## FILTER OUT MODELS THAT ARE NOT IN DIRECT_ACCESS_MODELS OR ACCESS_VIA_TEAM_IDS - only show user models they can call
+    all_models = [
+        _model
+        for _model in all_models
+        if _model.get("model_info", {}).get("direct_access", False)
+        or _model.get("model_info", {}).get("access_via_team_ids", [])
+    ]
+    return all_models
+
+
 @router.get(
     "/v2/model/info",
     description="v2 - returns models available to the user based on their API key permissions. Shows model info from config.yaml (except api key and api base). Filter to just user-added models with ?user_models_only=true",
@@ -5506,6 +5680,9 @@ async def model_info_v2(
     ),
     user_models_only: Optional[bool] = fastapi.Query(
         False, description="Only return models added by this user"
+    ),
+    include_team_models: Optional[bool] = fastapi.Query(
+        False, description="Return all models across all teams user is in."
     ),
     debug: Optional[bool] = False,
 ):
@@ -5522,6 +5699,12 @@ async def model_info_v2(
             },
         )
 
+    if prisma_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": CommonProxyErrors.db_not_connected_error.value},
+        )
+
     # Load existing config
     await proxy_config.get_config()
     all_models = copy.deepcopy(llm_router.model_list)
@@ -5529,10 +5712,6 @@ async def model_info_v2(
     if user_model is not None:
         # if user does not use a config.yaml, https://github.com/BerriAI/litellm/issues/2061
         all_models += [user_model]
-
-    # check all models user has access to in user_api_key_dict
-    if len(user_api_key_dict.models) > 0:
-        pass
 
     if model is not None:
         all_models = [m for m in all_models if m["model_name"] == model]
@@ -5545,6 +5724,13 @@ async def model_info_v2(
             prisma_client=prisma_client,
         )
 
+    if include_team_models:
+        all_models = await get_all_team_and_direct_access_models(
+            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
+            llm_router=llm_router,
+            all_models=all_models,
+        )
     # fill in model info based on config.yaml and litellm model_prices_and_context_window.json
     for _model in all_models:
         # provided model_info in config.yaml
@@ -5596,10 +5782,7 @@ async def model_info_v2(
         _model["model_info"] = model_info
         # don't return the api key / vertex credentials
         # don't return the llm credentials
-        _model["litellm_params"].pop("api_key", None)
-        _model["litellm_params"].pop("vertex_credentials", None)
-        _model["litellm_params"].pop("aws_access_key_id", None)
-        _model["litellm_params"].pop("aws_secret_access_key", None)
+        _model = remove_sensitive_info_from_deployment(_model)
 
     verbose_proxy_logger.debug("all_models: %s", all_models)
     return {"data": all_models}
@@ -7971,6 +8154,99 @@ async def delete_config_general_settings(
     return response
 
 
+@router.post(
+    "/config/callback/delete",
+    tags=["config.yaml"],
+    dependencies=[Depends(user_api_key_auth)],
+    include_in_schema=False,
+)
+async def delete_callback(
+    data: CallbackDelete,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Delete specific logging callback from configuration.
+    """
+    global prisma_client, proxy_config
+
+    if prisma_client is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": CommonProxyErrors.db_not_connected_error.value},
+        )
+
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "{}, your role={}".format(
+                    CommonProxyErrors.not_allowed_access.value,
+                    user_api_key_dict.user_role,
+                )
+            },
+        )
+
+    if store_model_in_db is not True:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Set `'STORE_MODEL_IN_DB='True'` in your env to enable this feature."
+            },
+        )
+
+    try:
+        # Get current configuration
+        config = await proxy_config.get_config()
+        callback_name = data.callback_name.lower()
+
+        # Check if callback exists in current configuration
+        litellm_settings = config.get("litellm_settings", {})
+        success_callbacks = litellm_settings.get("success_callback", [])
+
+        if callback_name not in success_callbacks:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": f"Callback '{callback_name}' not found in active configuration"
+                },
+            )
+
+        # Remove callback from success_callback list
+        success_callbacks.remove(callback_name)
+        config.setdefault("litellm_settings", {})[
+            "success_callback"
+        ] = success_callbacks
+
+        # Save the updated configuration
+        await proxy_config.save_config(new_config=config)
+
+        # Restart the proxy to apply changes
+        await proxy_config.add_deployment(
+            prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj
+        )
+
+        return {
+            "message": f"Successfully deleted callback: {callback_name}",
+            "removed_callback": callback_name,
+            "remaining_callbacks": success_callbacks,
+            "deleted_at": datetime.now().isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        verbose_proxy_logger.error(
+            f"litellm.proxy.proxy_server.delete_callback(): Exception occurred - {str(e)}"
+        )
+        verbose_proxy_logger.debug(traceback.format_exc())
+        raise ProxyException(
+            message="Error deleting callback: " + str(e),
+            type=ProxyErrorTypes.internal_server_error,
+            param="callback_name",
+            code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
 @router.get(
     "/get/config/callbacks",
     tags=["config.yaml"],
@@ -8266,7 +8542,6 @@ app.include_router(image_router)
 app.include_router(fine_tuning_router)
 app.include_router(credential_router)
 app.include_router(llm_passthrough_router)
-app.include_router(mcp_router)
 app.include_router(mcp_management_router)
 app.include_router(anthropic_router)
 app.include_router(langfuse_router)
@@ -8292,3 +8567,8 @@ app.include_router(model_management_router)
 app.include_router(tag_management_router)
 app.include_router(enterprise_router)
 app.include_router(ui_discovery_endpoints_router)
+########################################################
+# MCP Server
+########################################################
+app.mount(path=BASE_MCP_ROUTE, app=mcp_app)
+app.include_router(mcp_rest_endpoints_router)
